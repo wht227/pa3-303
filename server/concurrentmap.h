@@ -3,6 +3,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "map.h"
@@ -35,22 +36,58 @@ template <typename K, typename V> class ConcurrentMap : public Map<K, V> {
   // those structs directly, or hold pointers to those structs.  Your decision
   // will determine if you need a real destructor or not.
 
+  /// Each bucket holds its own mutex and a linked list of (key, value) pairs
+  struct Bucket {
+    std::mutex lock;
+    std::list<std::pair<K, V>> entries;
+  };
+
+  /// Total number of buckets in the hash table
+  size_t num_buckets;
+
+  /// Vector of pointers to buckets (since std::mutex cannot be copied/moved)
+  std::vector<Bucket *> buckets;
+
+  /// Helper function to hash a key and find its bucket index
+  size_t get_bucket_index(K key) {
+    std::hash<K> hasher;
+    return hasher(key) % num_buckets;
+  }
+
 public:
   /// Construct by specifying the number of buckets it should have
   ///
   /// @param _buckets The number of buckets
   ConcurrentMap(size_t _buckets) {
-    std::cout << "ConcurrentMap::ConcurrentMap() is not implemented";
+    num_buckets = _buckets;
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets.push_back(new Bucket());
+    }
   }
 
   /// Destruct the ConcurrentMap
   virtual ~ConcurrentMap() {
-    std::cout << "ConcurrentMap::~ConcurrentMap() is not implemented";
+    for (size_t i = 0; i < num_buckets; i++) {
+      delete buckets[i];
+    }
   }
 
   /// Clear the map.  This operation needs to use 2pl
   virtual void clear() {
-    std::cout << "ConcurrentMap::clear() is not implemented";
+    // Phase 1 (Growing phase): Acquire all bucket locks in order
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets[i]->lock.lock();
+    }
+
+    // Clear every bucket's linked list while all locks are held
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets[i]->entries.clear();
+    }
+
+    // Phase 2 (Shrinking phase): Release all bucket locks
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets[i]->lock.unlock();
+    }
   }
 
   /// Insert the provided key/value pair only if there is no mapping for the key
@@ -62,8 +99,19 @@ public:
   /// @return true if the key/value was inserted, false if the key already
   ///         existed in the table
   virtual bool insert(K key, V val) {
-    std::cout << "ConcurrentMap::insert() is not implemented";
-    return false;
+    size_t idx = get_bucket_index(key);
+    std::lock_guard<std::mutex> guard(buckets[idx]->lock);
+
+    // Check if the key already exists in this bucket's list
+    for (auto &pair : buckets[idx]->entries) {
+      if (pair.first == key) {
+        return false;
+      }
+    }
+
+    // Key does not exist yet, so add it to the end of the bucket's list
+    buckets[idx]->entries.push_back(std::make_pair(key, val));
+    return true;
   }
 
   /// Insert the provided key/value pair if there is no mapping for the key yet.
@@ -76,8 +124,20 @@ public:
   /// @return true if the key/value was inserted, false if the key already
   ///         existed in the table and was thus updated instead
   virtual bool upsert(K key, V val) {
-    std::cout << "ConcurrentMap::upsert() is not implemented";
-    return false;
+    size_t idx = get_bucket_index(key);
+    std::lock_guard<std::mutex> guard(buckets[idx]->lock);
+
+    // Search for the key; if found, update its value and return false
+    for (auto &pair : buckets[idx]->entries) {
+      if (pair.first == key) {
+        pair.second = val;
+        return false;
+      }
+    }
+
+    // Key was not found, so insert a new pair and return true
+    buckets[idx]->entries.push_back(std::make_pair(key, val));
+    return true;
   }
 
   /// Apply a function to the value associated with a given key.  The function
@@ -89,7 +149,17 @@ public:
   /// @return true if the key existed and the function was applied, false
   ///         otherwise
   virtual bool do_with(K key, std::function<void(V &)> f) {
-    std::cout << "ConcurrentMap::do_with() is not implemented";
+    size_t idx = get_bucket_index(key);
+    std::lock_guard<std::mutex> guard(buckets[idx]->lock);
+
+    // Search for the key; if found, apply function f to its modifiable value
+    for (auto &pair : buckets[idx]->entries) {
+      if (pair.first == key) {
+        f(pair.second);
+        return true;
+      }
+    }
+
     return false;
   }
 
@@ -102,7 +172,17 @@ public:
   /// @return true if the key existed and the function was applied, false
   ///         otherwise
   virtual bool do_with_readonly(K key, std::function<void(const V &)> f) {
-    std::cout << "ConcurrentMap::do_with_readonly() is not implemented";
+    size_t idx = get_bucket_index(key);
+    std::lock_guard<std::mutex> guard(buckets[idx]->lock);
+
+    // Search for the key; if found, apply function f to its const value
+    for (const auto &pair : buckets[idx]->entries) {
+      if (pair.first == key) {
+        f(pair.second);
+        return true;
+      }
+    }
+
     return false;
   }
 
@@ -112,7 +192,18 @@ public:
   ///
   /// @return true if the key was found and the value unmapped, false otherwise
   virtual bool remove(K key) {
-    std::cout << "ConcurrentMap::remove() is not implemented";
+    size_t idx = get_bucket_index(key);
+    std::lock_guard<std::mutex> guard(buckets[idx]->lock);
+
+    // Iterate through the bucket's list and erase the matching element
+    for (auto it = buckets[idx]->entries.begin();
+         it != buckets[idx]->entries.end(); ++it) {
+      if (it->first == key) {
+        buckets[idx]->entries.erase(it);
+        return true;
+      }
+    }
+
     return false;
   }
 
@@ -124,6 +215,26 @@ public:
   ///             useful for 2pl
   virtual void do_all_readonly(std::function<void(const K, const V &)> f,
                                std::function<void()> then) {
-    std::cout << "ConcurrentMap::do_all_readonly() is not implemented";
+    // Phase 1 (Growing phase): Lock all buckets in order
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets[i]->lock.lock();
+    }
+
+    // Apply function f to every (key, value) pair in every bucket
+    for (size_t i = 0; i < num_buckets; i++) {
+      for (const auto &pair : buckets[i]->entries) {
+        f(pair.first, pair.second);
+      }
+    }
+
+    // Run the 'then' function before releasing any locks (for 2PL chaining)
+    if (then) {
+      then();
+    }
+
+    // Phase 2 (Shrinking phase): Unlock all buckets
+    for (size_t i = 0; i < num_buckets; i++) {
+      buckets[i]->lock.unlock();
+    }
   }
 };
